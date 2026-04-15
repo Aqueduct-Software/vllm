@@ -1286,102 +1286,57 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
 
     @staticmethod
-    def _compute_dino_embeds(
-        images: list,
-        image_grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
+    def _compute_dino_embeds(images: list) -> torch.Tensor:
         """Compute DINO embeddings by calling the external DINO service.
 
-        Mirrors the training-side mm_plugin.py: each image is resized server-side
-        to the exact pixel dims Qwen's image processor produced so that DINO emits
-        ``h_patches * w_patches`` patch embeddings, one-to-one with Qwen patches.
-
         Args:
-            images: List of PIL Images (length N).
-            image_grid_thw: Tensor of shape (N, 3) — (t, h, w) in patch units.
+            images: List of PIL Images.
 
         Returns:
-            Flat tensor of shape (sum(h_i * w_i), 768) concatenated across images.
+            Tensor of shape (N, 196, 768).
         """
         import io
         import os
-        from concurrent.futures import ThreadPoolExecutor
+        import tempfile
 
         import requests
 
-        DINO_PATCH_SIZE = 16
-        dino_url = os.environ.get("DINO_ENDPOINT", "http://localhost:9100")
+        # Use a shared mount dir so the DINO container can read the files.
+        # DINO_SHARED_DIR should be a path visible to both containers.
+        # Falls back to /tmp if not set (works when both share the same fs).
+        shared_dir = os.environ.get("DINO_SHARED_DIR", "/tmp")
+        os.makedirs(shared_dir, exist_ok=True)
 
-        if not isinstance(image_grid_thw, torch.Tensor):
-            image_grid_thw = torch.as_tensor(image_grid_thw)
+        # Save PIL images to shared dir for the DINO service
+        tmp_paths = []
+        for img in images:
+            fd, path = tempfile.mkstemp(suffix=".png", dir=shared_dir)
+            os.close(fd)
+            img.save(path, format="PNG")
+            tmp_paths.append(path)
 
-        target_dims = []
-        for i in range(len(images)):
-            h_patches = int(image_grid_thw[i, 1].item())
-            w_patches = int(image_grid_thw[i, 2].item())
-            target_dims.append(
-                (h_patches * DINO_PATCH_SIZE, w_patches * DINO_PATCH_SIZE)
-            )
-
-        def _fetch_dino(args):
-            idx, img = args
-            th, tw = target_dims[idx]
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            buf.seek(0)
+        try:
+            dino_url = os.environ.get("DINO_ENDPOINT", "http://localhost:9100")
             resp = requests.post(
-                f"{dino_url}/embed",
-                files={"file": (f"img_{idx}.png", buf.read())},
-                data={"target_h": str(th), "target_w": str(tw)},
-                timeout=60,
+                f"{dino_url}/embed_paths",
+                json={"image_paths": tmp_paths},
+                timeout=30,
             )
             resp.raise_for_status()
-            embed = torch.load(
+            dino_embeds = torch.load(
                 io.BytesIO(resp.content),
                 map_location="cpu",
                 weights_only=True,
-            )  # (1, Np, 768)
-            return embed[0]  # (Np, 768)
+            )  # (N, 196, 768)
+        finally:
+            for p in tmp_paths:
+                os.unlink(p)
 
-        with ThreadPoolExecutor(max_workers=max(1, len(images))) as pool:
-            per_image = list(pool.map(_fetch_dino, enumerate(images)))
-
-        # Concatenate into a flat tensor; per-image splits are recovered at
-        # model time from image_grid_thw.
-        return torch.cat(per_image, dim=0)
-
-    @staticmethod
-    def _read_brep_bytes(brep_path: str) -> tuple[str, bytes]:
-        """Return ``(member_name, bytes)`` for a plain or zip-ref BRep path.
-
-        Zip references use the same naming convention as
-        ``llamafactory.data.mm_plugin._resolve_zip_breps``:
-        ``.../step_by_step_preprocessed.zip_{idx}`` → zip member
-        ``step_{idx}_preprocessed.pt`` (preprocessed tensor payload).
-        """
-        import os
-        import zipfile
-
-        marker = brep_path.find(".zip_")
-        if marker != -1:
-            zip_path = brep_path[: marker + 4]
-            idx = brep_path[marker + 5 :]
-            member = f"step_{idx}_preprocessed.pt"
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                data = zf.read(member)
-            return member, data
-
-        with open(brep_path, "rb") as f:
-            return os.path.basename(brep_path), f.read()
+        return dino_embeds
 
     @staticmethod
     def _compute_brep_embeds(brep_paths: list[str]) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
         """Compute BRep embeddings (global + face + edge) from the BRep service.
-
-        ``brep_paths`` may contain plain filesystem paths OR zip references
-        of the form ``path/to/step_by_step_preprocessed.zip_{idx}`` — zip
-        members (``step_{idx}_preprocessed.pt``) are extracted in-memory
-        before being POSTed to the BRep endpoint.
 
         Returns:
             Tuple of (brep_embeds, brep_grid_thw, face_counts, edge_counts):
@@ -1401,73 +1356,20 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             for i in range(num_brep_endpoints)
         ]
 
-        # Sentinel "blank" BRep: the training pipeline uses
-        # `blank_brep.xmt_txt` as a placeholder for a step where no prior
-        # geometry exists. The file is never actually read — the mm_plugin
-        # fills in a zero embedding with a single global/face/edge token
-        # each. Mirror that behavior here so inference requests that pass
-        # the sentinel path don't try to open a non-existent file or hit
-        # the BRep endpoint.
-        BLANK_BREP_BASENAME = "blank_brep.xmt_txt"
-
         def _fetch(args):
             idx, brep_path = args
-            if os.path.basename(brep_path) == BLANK_BREP_BASENAME:
-                g = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                f = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                e = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                return g, f, e
-
             url = brep_urls[idx % num_brep_endpoints]
-            name, data = Qwen3VLMultiModalProcessor._read_brep_bytes(brep_path)
-            # STEP files (e.g. rollout-time reconstructions) need the
-            # Reconstruction + postprocess pipeline on the server side,
-            # which lives behind /embed_step. Already preprocessed .pt
-            # tensors go straight to /embed.
-            suffix = os.path.splitext(name)[1].lower()
-            route = "/embed_step" if suffix in (".step", ".stp") else "/embed"
-            timeout = 120 if route == "/embed_step" else 30
-            resp = requests.post(
-                f"{url}{route}",
-                files={"file": (name, data)},
-                timeout=timeout,
-            )
+            with open(brep_path, "rb") as f:
+                resp = requests.post(
+                    f"{url}/embed",
+                    files={"file": (os.path.basename(brep_path), f)},
+                    timeout=30,
+                )
             resp.raise_for_status()
             result = resp.json()
-
-            # Hard-validate the payload. A degenerate response (None,
-            # empty list, wrong hidden size, blank flag on a non-blank
-            # request) would silently feed null embeddings into the
-            # model in intermediary rollout steps, so we raise loudly
-            # here instead of constructing a zero tensor.
-            if result.get("blank"):
-                raise RuntimeError(
-                    f"BRep endpoint returned blank payload for non-blank "
-                    f"input {brep_path!r}"
-                )
-            for key in ("global_embedding", "face_embeddings", "edge_embeddings"):
-                val = result.get(key)
-                if val is None or len(val) == 0:
-                    raise RuntimeError(
-                        f"BRep endpoint returned empty {key} for {brep_path!r}: "
-                        f"result keys={list(result.keys())}"
-                    )
-            embed_dim = int(result.get("embed_dim", 0))
-            if embed_dim != BREP_HIDDEN_SIZE:
-                raise RuntimeError(
-                    f"BRep endpoint returned embed_dim={embed_dim} "
-                    f"for {brep_path!r}, expected {BREP_HIDDEN_SIZE}"
-                )
-
             g = torch.tensor(result["global_embedding"], dtype=torch.bfloat16).unsqueeze(0)  # (1, D)
             f = torch.tensor(result["face_embeddings"], dtype=torch.bfloat16)                # (N, D)
             e = torch.tensor(result["edge_embeddings"], dtype=torch.bfloat16)                # (M, D)
-            if g.shape[-1] != BREP_HIDDEN_SIZE or f.shape[-1] != BREP_HIDDEN_SIZE or e.shape[-1] != BREP_HIDDEN_SIZE:
-                raise RuntimeError(
-                    f"BRep endpoint embedding hidden size mismatch for "
-                    f"{brep_path!r}: g={tuple(g.shape)}, f={tuple(f.shape)}, "
-                    f"e={tuple(e.shape)}, expected last dim {BREP_HIDDEN_SIZE}"
-                )
             return g, f, e
 
         from concurrent.futures import ThreadPoolExecutor
@@ -1624,24 +1526,17 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
 
         # Compute BRep embeddings BEFORE tokenization so we can expand
         # <brep> placeholders into the correct number of <|brep_pad|> tokens.
-        brep_payload: dict[str, torch.Tensor] | None = None
+        brep_embeds_out = None
+        self._brep_face_counts = None
+        self._brep_edge_counts = None
         if brep_paths:
-            brep_embeds, brep_grid_thw, face_counts, edge_counts = (
-                self._compute_brep_embeds(brep_paths)
-            )
-            brep_payload = {
-                "brep_embeds": brep_embeds,  # (total_tokens, 384)
-                "brep_grid_thw": brep_grid_thw,  # (num_breps, 1)
-                "brep_face_counts": torch.as_tensor(face_counts, dtype=torch.long),
-                "brep_edge_counts": torch.as_tensor(edge_counts, dtype=torch.long),
-            }
-            # Expand each <brep> placeholder in the prompt.
+            brep_embeds, brep_grid_thw, face_counts, edge_counts = self._compute_brep_embeds(brep_paths)
+            brep_embeds_out = brep_embeds.unsqueeze(0)  # (1, total_tokens, 384)
+            self._brep_face_counts = face_counts
+            self._brep_edge_counts = edge_counts
+            # Expand each <brep> placeholder in the prompt
             for count in brep_grid_thw.squeeze(1).tolist():
-                brep_pad_seq = (
-                    "<|brep_start|>"
-                    + "<|brep_pad|>" * int(count)
-                    + "<|brep_end|>"
-                )
+                brep_pad_seq = "<|brep_start|>" + "<|brep_pad|>" * int(count) + "<|brep_end|>"
                 prompt = prompt.replace("<brep>", brep_pad_seq, 1)
 
         processed_outputs = super()._call_hf_processor(
@@ -1655,20 +1550,14 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             **video_outputs,
         )
 
-        # Compute DINO embeddings for images, sized to match Qwen patches.
+        # Compute DINO embeddings for images
         if raw_images:
-            image_grid_thw = combined_outputs.get("image_grid_thw")
-            if image_grid_thw is None:
-                raise RuntimeError(
-                    "image_grid_thw missing from HF processor outputs; "
-                    "cannot align DINO embeddings."
-                )
             combined_outputs["dino_embeds"] = self._compute_dino_embeds(
-                raw_images, image_grid_thw
+                raw_images
             )
 
-        if brep_payload is not None:
-            combined_outputs.update(brep_payload)
+        if brep_embeds_out is not None:
+            combined_outputs["brep_embeds"] = brep_embeds_out
 
         return BatchFeature(combined_outputs)
 
@@ -1682,49 +1571,11 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 self.info.get_hf_config().vision_config.spatial_merge_size
             )(hf_inputs)
         )
-        # DINO embeddings: the flat tensor holds (h_i * w_i) patch rows per
-        # image concatenated along dim 0, so we slice per image using the
-        # Qwen patch grid.
-        if "dino_embeds" in hf_inputs and "image_grid_thw" in hf_inputs:
-            image_grid_thw = hf_inputs["image_grid_thw"]
-            if not isinstance(image_grid_thw, torch.Tensor):
-                image_grid_thw = torch.as_tensor(image_grid_thw)
-            dino_sizes = (image_grid_thw[:, 1] * image_grid_thw[:, 2]).to(
-                torch.long
-            )
-            fields["dino_embeds"] = MultiModalFieldConfig.flat_from_sizes(
-                "image", dino_sizes
-            )
-        # BRep fields ride along with the image modality as shared data so
-        # the underlying tensors are passed through untouched. We only
-        # register them when images are present in `hf_inputs`:
-        #
-        # - In the normal path, a fresh request with image + brep hits this
-        #   branch and the brep fields are cached alongside the image item.
-        # - In the vLLM mm-cache path, a subsequent request whose image is
-        #   a cache hit calls this function again with ONLY the missing
-        #   items (no image, so no `image_grid_thw`). The cached image item
-        #   already carries the previously-computed brep fields, so the
-        #   missing-items pass should skip re-registering them. Unregistered
-        #   fields in `hf_inputs` are silently dropped by
-        #   `MultiModalKwargsItems.from_hf_inputs`, which is the behavior
-        #   we want here.
-        image_grid_thw = hf_inputs.get("image_grid_thw")
-        if "brep_embeds" in hf_inputs and image_grid_thw is not None:
-            n_images = int(len(image_grid_thw))
-            if n_images > 0:
-                fields["brep_embeds"] = MultiModalFieldConfig.shared(
-                    "image", batch_size=n_images
-                )
-                fields["brep_grid_thw"] = MultiModalFieldConfig.shared(
-                    "image", batch_size=n_images
-                )
-                fields["brep_face_counts"] = MultiModalFieldConfig.shared(
-                    "image", batch_size=n_images
-                )
-                fields["brep_edge_counts"] = MultiModalFieldConfig.shared(
-                    "image", batch_size=n_images
-                )
+        # DINO embeddings: one (196, 768) tensor per image
+        fields["dino_embeds"] = MultiModalFieldConfig.batched("image")
+        # BRep embeddings: one (num_faces, 384) tensor per image
+        if "brep_embeds" in hf_inputs:
+            fields["brep_embeds"] = MultiModalFieldConfig.batched("image")
         return fields
 
     def _get_prompt_updates(
@@ -2385,32 +2236,12 @@ class Qwen3VLForConditionalGeneration(
         target_dtype: torch.dtype,
         target_device: torch.device,
     ) -> torch.Tensor:
-        """Align DINO embeds to patch-level temporal frames, then project + gate.
-
-        Accepts ``dino_embeds`` in any of the shapes the upstream pipeline may
-        produce:
-
-        - ``(sum_i h_i * w_i, 768)`` flat tensor (from the
-          ``flat_from_sizes`` MM field — the normal vLLM path).
-        - ``(B, Np, 768)`` stacked tensor (all images same size).
-        - a list / tuple of ``(Np_i, 768)`` tensors.
-        """
+        """Align DINO embeds to patch-level temporal frames, then project + gate."""
         B = grid_thw.size(0)
-        sizes = [
-            int(grid_thw[i, 1].item() * grid_thw[i, 2].item()) for i in range(B)
-        ]
-
-        if isinstance(dino_embeds, torch.Tensor) and dino_embeds.dim() == 2:
-            splits = list(torch.split(dino_embeds, sizes, dim=0))
-        elif isinstance(dino_embeds, (list, tuple)):
-            splits = list(dino_embeds)
-        else:
-            splits = [dino_embeds[i] for i in range(B)]
-
         dino_per_img = []
         for i in range(B):
             t_i = int(grid_thw[i, 0].item())
-            patch_i = splits[i]
+            patch_i = dino_embeds[i]  # (Np, 768)
             if t_i > 1:
                 patch_i = patch_i.repeat(t_i, 1)
             dino_per_img.append(patch_i)
@@ -3012,57 +2843,28 @@ class Qwen3VLForConditionalGeneration(
         return tuple(mm_embeddings_out), positions, mrope_positions_delta
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
-        # Extract non-standard mm fields before parsing. These were plumbed
-        # through the processor's _get_mm_fields_config, so they arrive as
-        # plain kwargs here.
+        # Extract non-standard mm fields before parsing
         dino_embeds = kwargs.pop("dino_embeds", None)
         brep_embeds = kwargs.pop("brep_embeds", None)
-        brep_grid_thw = kwargs.pop("brep_grid_thw", None)
-        brep_face_counts = kwargs.pop("brep_face_counts", None)
-        brep_edge_counts = kwargs.pop("brep_edge_counts", None)
 
         # Project BRep embeddings and buffer them for embed_input_ids.
         # BRep tokens (<|brep_pad|>) are NOT in the image/video multimodal
         # mask, so they must be scattered separately in embed_input_ids.
         if brep_embeds is not None:
+            # brep_embeds arrives as (1, total_tokens, 384) from batched("image");
+            # squeeze batch dim to get (total_tokens, 384) for the projector.
             if brep_embeds.ndim == 3:
-                # Legacy / batched("image") path would have added a leading 1.
-                brep_embeds = brep_embeds.reshape(-1, brep_embeds.shape[-1])
-
-            # Resolve per-sample totals and per-type counts.
-            if brep_grid_thw is not None:
-                total_counts = brep_grid_thw.reshape(-1).tolist()
-            else:
-                total_counts = [int(brep_embeds.shape[0])]
-            face_counts = (
-                brep_face_counts.reshape(-1).tolist()
-                if brep_face_counts is not None
-                else [0] * len(total_counts)
+                brep_embeds = brep_embeds.squeeze(0)
+            # Retrieve per-type counts stashed by the processor
+            face_counts = getattr(self, "_brep_face_counts", None) or [0]
+            edge_counts = getattr(self, "_brep_edge_counts", None) or [0]
+            # For single-brep inference, project the one sample directly
+            self._brep_projected = self.brep_projector(
+                brep_embeds.to(device=self.visual.device, dtype=self.visual.dtype),
+                num_global=1,
+                num_faces=face_counts[0],
+                num_edges=edge_counts[0],
             )
-            edge_counts = (
-                brep_edge_counts.reshape(-1).tolist()
-                if brep_edge_counts is not None
-                else [0] * len(total_counts)
-            )
-
-            brep_dev = brep_embeds.to(
-                device=self.visual.device, dtype=self.visual.dtype
-            )
-            projected_parts: list[torch.Tensor] = []
-            offset = 0
-            for total, nf, ne in zip(total_counts, face_counts, edge_counts):
-                total = int(total)
-                sample = brep_dev[offset : offset + total]
-                projected_parts.append(
-                    self.brep_projector(
-                        sample,
-                        num_global=1,
-                        num_faces=int(nf),
-                        num_edges=int(ne),
-                    )
-                )
-                offset += total
-            self._brep_projected = torch.cat(projected_parts, dim=0)
         else:
             self._brep_projected = None
 
