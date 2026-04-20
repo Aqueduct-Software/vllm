@@ -1410,65 +1410,74 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         # the BRep endpoint.
         BLANK_BREP_BASENAME = "blank_brep.xmt_txt"
 
+        def _degenerate_fallback() -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+            """1-face, 1-edge zero embeds. Used when the endpoint fails
+            (OOM, 5xx, bad input). Keeps rollouts/evals alive — the model
+            sees a null brep rather than crashing the whole request."""
+            return (
+                torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
+                torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
+                torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
+            )
+
         def _fetch(args):
             idx, brep_path = args
             if os.path.basename(brep_path) == BLANK_BREP_BASENAME:
-                g = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                f = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                e = torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16)
-                return g, f, e
+                return _degenerate_fallback()
 
             url = brep_urls[idx % num_brep_endpoints]
-            name, data = Qwen3VLMultiModalProcessor._read_brep_bytes(brep_path)
             # STEP files (e.g. rollout-time reconstructions) need the
             # Reconstruction + postprocess pipeline on the server side,
             # which lives behind /embed_step. Already preprocessed .pt
             # tensors go straight to /embed.
-            suffix = os.path.splitext(name)[1].lower()
-            route = "/embed_step" if suffix in (".step", ".stp") else "/embed"
-            timeout = 120 if route == "/embed_step" else 30
-            resp = requests.post(
-                f"{url}{route}",
-                files={"file": (name, data)},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-
-            # Hard-validate the payload. A degenerate response (None,
-            # empty list, wrong hidden size, blank flag on a non-blank
-            # request) would silently feed null embeddings into the
-            # model in intermediary rollout steps, so we raise loudly
-            # here instead of constructing a zero tensor.
-            if result.get("blank"):
-                raise RuntimeError(
-                    f"BRep endpoint returned blank payload for non-blank "
-                    f"input {brep_path!r}"
+            try:
+                name, data = Qwen3VLMultiModalProcessor._read_brep_bytes(brep_path)
+                suffix = os.path.splitext(name)[1].lower()
+                route = "/embed_step" if suffix in (".step", ".stp") else "/embed"
+                timeout = 120 if route == "/embed_step" else 30
+                resp = requests.post(
+                    f"{url}{route}",
+                    files={"file": (name, data)},
+                    timeout=timeout,
                 )
-            for key in ("global_embedding", "face_embeddings", "edge_embeddings"):
-                val = result.get(key)
-                if val is None or len(val) == 0:
+                resp.raise_for_status()
+                result = resp.json()
+
+                for key in ("global_embedding", "face_embeddings", "edge_embeddings"):
+                    val = result.get(key)
+                    if val is None or len(val) == 0:
+                        raise RuntimeError(
+                            f"BRep endpoint returned empty {key} for {brep_path!r}: "
+                            f"result keys={list(result.keys())}"
+                        )
+                embed_dim = int(result.get("embed_dim", 0))
+                if embed_dim != BREP_HIDDEN_SIZE:
                     raise RuntimeError(
-                        f"BRep endpoint returned empty {key} for {brep_path!r}: "
-                        f"result keys={list(result.keys())}"
+                        f"BRep endpoint returned embed_dim={embed_dim} "
+                        f"for {brep_path!r}, expected {BREP_HIDDEN_SIZE}"
                     )
-            embed_dim = int(result.get("embed_dim", 0))
-            if embed_dim != BREP_HIDDEN_SIZE:
-                raise RuntimeError(
-                    f"BRep endpoint returned embed_dim={embed_dim} "
-                    f"for {brep_path!r}, expected {BREP_HIDDEN_SIZE}"
-                )
 
-            g = torch.tensor(result["global_embedding"], dtype=torch.bfloat16).unsqueeze(0)  # (1, D)
-            f = torch.tensor(result["face_embeddings"], dtype=torch.bfloat16)                # (N, D)
-            e = torch.tensor(result["edge_embeddings"], dtype=torch.bfloat16)                # (M, D)
-            if g.shape[-1] != BREP_HIDDEN_SIZE or f.shape[-1] != BREP_HIDDEN_SIZE or e.shape[-1] != BREP_HIDDEN_SIZE:
-                raise RuntimeError(
-                    f"BRep endpoint embedding hidden size mismatch for "
-                    f"{brep_path!r}: g={tuple(g.shape)}, f={tuple(f.shape)}, "
-                    f"e={tuple(e.shape)}, expected last dim {BREP_HIDDEN_SIZE}"
+                g = torch.tensor(result["global_embedding"], dtype=torch.bfloat16).unsqueeze(0)  # (1, D)
+                f = torch.tensor(result["face_embeddings"], dtype=torch.bfloat16)                # (N, D)
+                e = torch.tensor(result["edge_embeddings"], dtype=torch.bfloat16)                # (M, D)
+                if g.shape[-1] != BREP_HIDDEN_SIZE or f.shape[-1] != BREP_HIDDEN_SIZE or e.shape[-1] != BREP_HIDDEN_SIZE:
+                    raise RuntimeError(
+                        f"BRep endpoint embedding hidden size mismatch for "
+                        f"{brep_path!r}: g={tuple(g.shape)}, f={tuple(f.shape)}, "
+                        f"e={tuple(e.shape)}, expected last dim {BREP_HIDDEN_SIZE}"
+                    )
+                return g, f, e
+            except Exception as exc:  # noqa: BLE001
+                # Endpoint now returns HTTP 500 on internal failure (OOM,
+                # corrupt .pt, degenerate input) — catch that and any other
+                # transport error so a single bad brep doesn't tank the
+                # whole chat/completions request.
+                print(
+                    f"[qwen3_vl] brep fetch failed for {brep_path!r}: "
+                    f"{type(exc).__name__}: {exc} — falling back to 1/1 zero embeds",
+                    flush=True,
                 )
-            return g, f, e
+                return _degenerate_fallback()
 
         from concurrent.futures import ThreadPoolExecutor
 
