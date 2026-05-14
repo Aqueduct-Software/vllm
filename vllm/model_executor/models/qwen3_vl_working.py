@@ -1391,19 +1391,15 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 edge_counts:  list of int — num edge tokens per BRep
         """
         import os
-        import socket
-        import time
 
         import requests
 
-        # Single per-node brep endpoint (one FastAPI process bound to
-        # BREP_PORT, internally async with 64-worker preprocess pool +
-        # 8 GPU queues — concurrent POSTs are the intended use).
-        # brep_fetch_parallelism is the client-side thread-pool size we
-        # fan into the single URL.
-        brep_port = int(os.environ.get("BREP_PORT", "9200"))
-        brep_url = f"http://localhost:{brep_port}"
-        brep_fetch_parallelism = 16
+        brep_base_port = int(os.environ.get("BREP_BASE_PORT", "9200"))
+        num_brep_endpoints = int(os.environ.get("NUM_BREP_ENDPOINTS", "8"))
+        brep_urls = [
+            f"http://localhost:{brep_base_port + i}"
+            for i in range(num_brep_endpoints)
+        ]
 
         # Sentinel "blank" BRep: the training pipeline uses
         # `blank_brep.xmt_txt` as a placeholder for a step where no prior
@@ -1413,29 +1409,23 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         # the sentinel path don't try to open a non-existent file or hit
         # the BRep endpoint.
         BLANK_BREP_BASENAME = "blank_brep.xmt_txt"
-        host = socket.gethostname()
 
-        def _degenerate_fallback(reason: str = "blank") -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        def _degenerate_fallback() -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
             """1-face, 1-edge zero embeds. Used when the endpoint fails
             (OOM, 5xx, bad input). Keeps rollouts/evals alive — the model
             sees a null brep rather than crashing the whole request."""
-            print(
-                f"[qwen3_vl.brep_degen] host={host} reason={reason} "
-                f"-> 1/1 zero embeds",
-                flush=True,
-            )
             return (
                 torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
                 torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
                 torch.zeros(1, BREP_HIDDEN_SIZE, dtype=torch.bfloat16),
             )
 
-        def _fetch(brep_path):
+        def _fetch(args):
+            idx, brep_path = args
             if os.path.basename(brep_path) == BLANK_BREP_BASENAME:
-                return _degenerate_fallback(reason="blank_sentinel")
+                return _degenerate_fallback()
 
-            url = brep_url
-            t0 = time.time()
+            url = brep_urls[idx % num_brep_endpoints]
             # STEP files (e.g. rollout-time reconstructions) need the
             # Reconstruction + postprocess pipeline on the server side,
             # which lives behind /embed_step. Already preprocessed .pt
@@ -1476,49 +1466,23 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                         f"{brep_path!r}: g={tuple(g.shape)}, f={tuple(f.shape)}, "
                         f"e={tuple(e.shape)}, expected last dim {BREP_HIDDEN_SIZE}"
                     )
-                elapsed = time.time() - t0
-                print(
-                    f"[qwen3_vl.brep_fetch] host={host} "
-                    f"path={os.path.basename(name)} route={route} ok "
-                    f"faces={f.shape[0]} edges={e.shape[0]} "
-                    f"grid_thw={1 + f.shape[0] + e.shape[0]} elapsed={elapsed:.2f}s",
-                    flush=True,
-                )
                 return g, f, e
             except Exception as exc:  # noqa: BLE001
                 # Endpoint now returns HTTP 500 on internal failure (OOM,
                 # corrupt .pt, degenerate input) — catch that and any other
                 # transport error so a single bad brep doesn't tank the
                 # whole chat/completions request.
-                elapsed = time.time() - t0
                 print(
-                    f"[qwen3_vl.brep_fetch] host={host} "
-                    f"path={os.path.basename(brep_path)} FAIL "
-                    f"{type(exc).__name__}: {exc} elapsed={elapsed:.2f}s "
-                    f"— falling back to 1/1 zero embeds",
+                    f"[qwen3_vl] brep fetch failed for {brep_path!r}: "
+                    f"{type(exc).__name__}: {exc} — falling back to 1/1 zero embeds",
                     flush=True,
                 )
-                return _degenerate_fallback(reason=f"fetch_fail:{type(exc).__name__}")
+                return _degenerate_fallback()
 
         from concurrent.futures import ThreadPoolExecutor
 
-        n_blank = sum(
-            1 for p in brep_paths
-            if os.path.basename(p) == BLANK_BREP_BASENAME
-        )
-        print(
-            f"[qwen3_vl.brep_batch] host={host} START n_paths={len(brep_paths)} "
-            f"n_blank={n_blank} max_workers={brep_fetch_parallelism} url={brep_url}",
-            flush=True,
-        )
-        t0_batch = time.time()
-        with ThreadPoolExecutor(max_workers=brep_fetch_parallelism) as pool:
-            results = list(pool.map(_fetch, brep_paths))
-        print(
-            f"[qwen3_vl.brep_batch] host={host} DONE n_paths={len(brep_paths)} "
-            f"total_elapsed={time.time() - t0_batch:.2f}s",
-            flush=True,
-        )
+        with ThreadPoolExecutor(max_workers=num_brep_endpoints) as pool:
+            results = list(pool.map(_fetch, enumerate(brep_paths)))
 
         brep_embeds_list = []
         counts = []
